@@ -21,9 +21,8 @@ $Settings = @{
         "$env:USERPROFILE\AppData\Local\Programs\WinSCP\WinSCP.exe",
         "$PSScriptRoot\WinSCP\WinSCP.exe"
     )
-    Editor = ""                      # Editor command (e.g. 'code --wait' or full path), blank = auto-detect
     UndoStackLimit = 50              # Maximum undo/redo history
-    RecentGroupsLimit = 10           # Number of recent groups to remember
+    RecentGroupsLimit = 50           # Number of recent groups to remember
 }
 
 # New WT settings with sensible defaults (persisted)
@@ -61,13 +60,6 @@ function Save-Settings {
 
 # Load persisted settings (if present)
 Load-Settings
-
-# Auto-detect Editor if not set
-if (-not $Settings.Editor -or $Settings.Editor.Trim() -eq "") {
-    if ($env:EDITOR) { $Settings.Editor = $env:EDITOR }
-    elseif (Get-Command code -ErrorAction SilentlyContinue) { $Settings.Editor = 'code --wait' }
-    else { $Settings.Editor = 'notepad' }
-}
 
 # Recent groups tracking
 $Global:RecentGroups = @()
@@ -196,78 +188,130 @@ function Parse-SSHConfig {
         [System.Windows.MessageBox]::Show("Failed to read SSH config: $($_.Exception.Message)","Read Error",[System.Windows.MessageBoxButton]::OK,[System.Windows.MessageBoxImage]::Error)
         return @()
     }
-    
+
     if ($null -eq $text) { $text = "" }
     $lines = [System.Text.RegularExpressions.Regex]::Split($text, "`r?`n")
     $blocks = @()
+
+    # Start with an empty global block
     $current = @{ Type='global'; HeaderLines=@(); Lines=@(); HostPatterns=@(); Group=$null }
+
     $groupPattern = '^' + $EscapedGroupPrefix + '\s*(.+)$'
+    $indentedGroupPattern = '^\s*' + $EscapedGroupPrefix + '\s*(.+)$'
 
-    for ($i=0; $i -lt $lines.Length; $i++) {
+    for ($i = 0; $i -lt $lines.Length; $i++) {
         $line = $lines[$i]
-        $trim = $line.Trim()
+        $trim = if ($null -ne $line) { [string]$line.Trim() } else { "" }
 
-        if ($trim -match $groupPattern -and $current.Type -ne 'host') {
-            # Keep comment lines in header for now (we will normalize later)
-            $current.HeaderLines += $line
-            continue
-        }
-
+        # If this line is a Host header, finalize the current block and start a host block
         if ($trim -match '^(?i)Host\s+(.+)$') {
-            $blocks += $current
             $patterns = $Matches[1].Trim().Split() | Where-Object { $_ -ne '' }
-            $group = $null
-            foreach ($header in $current.HeaderLines) {
-                if ($header.Trim() -match $groupPattern) {
-                    $group = $Matches[1].Trim()
-                    Add-RecentGroup -groupName $group
+
+            # Look for older-style group comment in the immediately preceding header lines (closest to this Host)
+            $groupForNewHost = $null
+            if ($current.HeaderLines -and $current.HeaderLines.Count -gt 0) {
+                for ($h = $current.HeaderLines.Count - 1; $h -ge 0; $h--) {
+                    $hdr = [string]$current.HeaderLines[$h]
+                    $hdrTrim = $hdr.Trim()
+                    if ($hdrTrim -match $groupPattern) {
+                        $groupForNewHost = $Matches[1].Trim()
+                        break
+                    }
+                    # If we find any non-comment line stop scanning upward for group
+                    if (-not ($hdrTrim.StartsWith('#'))) { break }
+                }
+
+                if ($groupForNewHost) {
+                    # remove any header lines that are group comments
+                    $current.HeaderLines = $current.HeaderLines | Where-Object { -not ([string]$_).Trim() -match $groupPattern }
+                    Add-RecentGroup -groupName $groupForNewHost
                 }
             }
-            $current = @{ Type='host'; HeaderLines = @($line); Lines = @(); HostPatterns = $patterns; Group = $group }
+
+            # Push the preceding block
+            $blocks += $current
+
+            # Create the new host block
+            $initialLines = @()
+            $current = @{
+                Type = 'host'
+                HeaderLines = @($line)
+                Lines = $initialLines
+                HostPatterns = $patterns
+                Group = if ($groupForNewHost) { $groupForNewHost } else { $null }
+            }
             continue
-        } else {
-            $current.Lines += $line
         }
+
+        # Otherwise append the line to current.Lines
+        $current.Lines += $line
     }
+
+    # Append the final block
     $blocks += $current
 
-    # Normalize group comment location:
+    # Second pass: detect indented "# GROUP:" inside host lines and normalize
     foreach ($b in $blocks) {
         if ($b.Type -ne 'host') { continue }
 
-        $group = $null
-        # 1) header lines (older style): look for group comment there
-        for ($j = 0; $j -lt $b.HeaderLines.Count; $j++) {
-            $h = $b.HeaderLines[$j]
-            if ($h.Trim() -match $groupPattern) {
-                $group = $Matches[1].Trim()
-                break
-            }
+        # Ensure arrays & strings
+        if ($null -eq $b.Lines) { $b.Lines = @() }
+        if (-not ($b.Lines -is [System.Array])) { $b.Lines = @($b.Lines) }
+        $b.Lines = $b.Lines | ForEach-Object { [string]$_ }
+
+        # find first non-empty line index
+        $firstNonEmptyIdx = -1
+        for ($j = 0; $j -lt $b.Lines.Count; $j++) {
+            if ($b.Lines[$j].Trim() -ne '') { $firstNonEmptyIdx = $j; break }
         }
-        if ($group) {
-            # remove any header lines that are group comments
-            $b.HeaderLines = $b.HeaderLines | Where-Object { -not ($_.Trim() -match $groupPattern) }
-            $b.Group = $group
-            Add-RecentGroup -groupName $group
-            continue
+        if ($firstNonEmptyIdx -ge 0) {
+            $firstLine = $b.Lines[$firstNonEmptyIdx]
+            if ($firstLine -match $indentedGroupPattern) {
+                $g = $Matches[1].Trim()
+                if ($g -ne '') {
+                    $b.Group = $g
+                    Add-RecentGroup -groupName $g
+                }
+                # remove that line
+                $before = if ($firstNonEmptyIdx -gt 0) { $b.Lines[0..($firstNonEmptyIdx-1)] } else { @() }
+                $after = if ($firstNonEmptyIdx -lt ($b.Lines.Count - 1)) { $b.Lines[($firstNonEmptyIdx+1)..($b.Lines.Count-1)] } else { @() }
+                $b.Lines = $before + $after
+            }
         }
 
-        # 2) new style: check first line of Lines for an indented group comment
-        if ($b.Lines.Count -gt 0) {
-            $firstLine = $b.Lines[0]
-            $linePattern = '^\s*' + $EscapedGroupPrefix + '\s*(.+)$'
-            if ($firstLine -match $linePattern) {
-                $group = $Matches[1].Trim()
-                # remove the first line from Lines
-                if ($b.Lines.Count -eq 1) {
-                    $b.Lines = @()
-                } else {
-                    $b.Lines = $b.Lines[1..($b.Lines.Count-1)]
+        # Also: detect any group lines that might be in headerlines for this block (rare) and remove them
+        if ($b.HeaderLines -and $b.HeaderLines.Count -gt 0) {
+            for ($h = $b.HeaderLines.Count - 1; $h -ge 0; $h--) {
+                $hdr = [string]$b.HeaderLines[$h]
+                if ($hdr.Trim() -match $groupPattern) {
+                    $b.Group = $Matches[1].Trim()
+                    Add-RecentGroup -groupName $b.Group
                 }
-                $b.Group = $group
-                Add-RecentGroup -groupName $group
             }
+            $b.HeaderLines = $b.HeaderLines | Where-Object { -not ([string]$_).Trim() -match $groupPattern }
         }
+    }
+
+    # Final normalization: ensure HeaderLines and Lines (and HostPatterns) are arrays of strings (no chars)
+    foreach ($b in $blocks) {
+        if ($null -eq $b.HeaderLines) {
+            $b.HeaderLines = @()
+        } elseif (-not ($b.HeaderLines -is [System.Array])) {
+            $b.HeaderLines = @($b.HeaderLines)
+        }
+        $b.HeaderLines = $b.HeaderLines | ForEach-Object { [string]$_ }
+
+        if ($null -eq $b.Lines) {
+            $b.Lines = @()
+        } elseif (-not ($b.Lines -is [System.Array])) {
+            $b.Lines = @($b.Lines)
+        }
+        $b.Lines = $b.Lines | ForEach-Object { [string]$_ }
+
+        # Ensure HostPatterns is an array of strings
+        if ($null -eq $b.HostPatterns) { $b.HostPatterns = @() }
+        if (-not ($b.HostPatterns -is [System.Array])) { $b.HostPatterns = @($b.HostPatterns) }
+        $b.HostPatterns = $b.HostPatterns | ForEach-Object { [string]$_ }
     }
 
     return $blocks
@@ -277,19 +321,99 @@ function Write-SSHConfigFromBlocks {
     param([array]$blocks)
     Backup-Config
     $out = @()
+
     foreach ($block in $blocks) {
+        # Defensive normalization
+        if ($null -eq $block.HeaderLines) { $block.HeaderLines = @() }
+        if (-not ($block.HeaderLines -is [System.Array])) { $block.HeaderLines = @($block.HeaderLines) }
+        $block.HeaderLines = $block.HeaderLines | ForEach-Object { [string]$_ }
+
+        if ($null -eq $block.Lines) { $block.Lines = @() }
+        if (-not ($block.Lines -is [System.Array])) { $block.Lines = @($block.Lines) }
+        $block.Lines = $block.Lines | ForEach-Object { [string]$_ }
+
+        # For host blocks: prepare a single Host header and reorganize header lines
+        if ($block.Type -eq 'host') {
+            $hostLine = ""
+            if ($block.HostPatterns -and $block.HostPatterns.Count -gt 0) {
+                $hostLine = "Host " + ($block.HostPatterns -join ' ')
+            } else {
+                $found = ($block.HeaderLines | Where-Object { $_ -match '^(?i)Host\s+' } | Select-Object -First 1)
+                if ($found) { $hostLine = [string]$found }
+            }
+            $hostLine = [string]$hostLine
+
+            # Partition header lines into blank-only, comment/text (non-Host, non-blank) and Host lines
+            $blankHeaders   = @()
+            $commentHeaders = @()
+            foreach ($h in $block.HeaderLines) {
+                $s = [string]$h
+                if ($s -match '^(?i)Host\s+') { continue }         # ignore existing Host lines (we will emit canonical hostLine)
+                if ($s.Trim() -eq '') { $blankHeaders += $s }     # pure blank separators
+                else { $commentHeaders += $s }                    # other header/comment lines
+            }
+
+            # We'll write blankHeaders BEFORE the Host header (preserves visual separation above the Host).
+            # Then write the canonical hostLine, then any commentHeaders (non-empty header comments).
+            # Store new HeaderLines for possible duplication checks later
+            if ($blankHeaders.Count -gt 0) {
+                # blank headers will be emitted prior to Host header rather than sitting after it
+                $preHeaderBlanks = $blankHeaders
+            } else {
+                $preHeaderBlanks = @()
+            }
+
+            $block.HeaderLines = @()
+            if ($hostLine -and $hostLine.Trim() -ne '') {
+                $block.HeaderLines += $hostLine
+            }
+            foreach ($ch in $commentHeaders) { $block.HeaderLines += $ch }
+        } else {
+            $preHeaderBlanks = @()
+        }
+
+        # Emit any blank lines that should appear before the header (preserve separation)
+        foreach ($b in $preHeaderBlanks) { $out += $b }
+
+        # Write header lines
         foreach ($header in $block.HeaderLines) { $out += $header }
-        foreach ($line in $block.Lines) { $out += $line }
+
+        # Write normalized group comment for host blocks if logical group exists
+        if ($block.Type -eq 'host' -and $block.Group -and $block.Group.Trim() -ne '') {
+            # Avoid duplication: if a group-like line already exists in header/lines, skip adding
+            $hasGroupLine = $false
+            $checkLines = @()
+            $checkLines += $block.HeaderLines
+            $checkLines += $block.Lines
+            foreach ($ln in $checkLines) {
+                if ([string]$ln -match '^\s*' + [regex]::Escape($GroupPrefix) + '\s*') {
+                    $hasGroupLine = $true
+                    break
+                }
+            }
+            if (-not $hasGroupLine) {
+                $out += "    $GroupPrefix $($block.Group.Trim())"
+            }
+        }
+
+        # Write block lines: defensive split of any element that might contain embedded newlines
+        foreach ($line in $block.Lines) {
+            # split on CR/LF sequences so each logical line becomes its own output element
+            $pieces = [System.Text.RegularExpressions.Regex]::Split([string]$line, "`r?`n")
+            foreach ($p in $pieces) { $out += $p }
+        }
     }
-    $content = ($out -join [Environment]::NewLine) + [Environment]::NewLine
-    
+
+    $content = ($out -join [Environment]::NewLine)
+    if ($content -ne '') { $content += [Environment]::NewLine }
+
     try {
         Set-Content -Path $SshConfigPath -Value $content -Encoding utf8 -ErrorAction Stop
         $Global:HasUnsavedChanges = $false
     } catch {
         [System.Windows.MessageBox]::Show("Failed to write SSH config: $($_.Exception.Message)","Write Error",[System.Windows.MessageBoxButton]::OK,[System.Windows.MessageBoxImage]::Error)
     }
-    
+
     UpdateUndoStatus
 }
 
@@ -306,8 +430,9 @@ function Get-HostObjectsFromBlocks {
         $hostName = ($block.Lines | Where-Object { $_ -match '^(?i)\s*HostName\s+(.+)$' } | ForEach-Object { $Matches[1].Trim() }) | Select-Object -First 1
         $user = ($block.Lines | Where-Object { $_ -match '^(?i)\s*User\s+(.+)$' } | ForEach-Object { $Matches[1].Trim() }) | Select-Object -First 1
         $port = ($block.Lines | Where-Object { $_ -match '^(?i)\s*Port\s+(.+)$' } | ForEach-Object { $Matches[1].Trim() }) | Select-Object -First 1
-        # Exclude group comment line (which we store in Lines as first line) from Additional
-        $additionalLines = $block.Lines | Where-Object { -not ($_ -match '^\s*' + [regex]::Escape($GroupPrefix) + '\s*') } | Where-Object { -not ($_ -match '^(?i)\s*(HostName|User|Port)\s+') }
+
+        # Exclude group comment line (groups are stored in block.Group), and exclude host/user/port lines from Additional
+        $additionalLines = $block.Lines | Where-Object { -not ([string]$_ -match '^\s*' + [regex]::Escape($GroupPrefix) + '\s*') } | Where-Object { -not ([string]$_ -match '^(?i)\s*(HostName|User|Port)\s+') }
         $additionalText = ($additionalLines -join [Environment]::NewLine)
         
         $obj = [pscustomobject]@{
@@ -330,6 +455,13 @@ function UpdateBlockFromItem {
     if ($idx -lt 0 -or $idx -ge $Global:Blocks.Count) { return }
     $block = $Global:Blocks[$idx]
 
+    # Defensive: make sure HeaderLines and Lines are arrays of strings
+    if ($null -eq $block.HeaderLines) { $block.HeaderLines = @() } elseif (-not ($block.HeaderLines -is [System.Array])) { $block.HeaderLines = @($block.HeaderLines) }
+    $block.HeaderLines = $block.HeaderLines | ForEach-Object { [string]$_ }
+
+    if ($null -eq $block.Lines) { $block.Lines = @() } elseif (-not ($block.Lines -is [System.Array])) { $block.Lines = @($block.Lines) }
+    $block.Lines = $block.Lines | ForEach-Object { [string]$_ }
+
     # Host patterns
     $newPatterns = ($item.Pattern -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
     if ($newPatterns.Count -gt 0) {
@@ -337,7 +469,7 @@ function UpdateBlockFromItem {
         $hostLine = "Host " + ($newPatterns -join ' ')
         $foundHost = $false
         for ($headerIndex=0; $headerIndex -lt $block.HeaderLines.Count; $headerIndex++) {
-            if ($block.HeaderLines[$headerIndex].Trim() -match '^(?i)Host\s+(.+)$') { 
+            if ([string]$block.HeaderLines[$headerIndex] -match '^(?i)Host\s+(.+)$') { 
                 $block.HeaderLines[$headerIndex] = $hostLine
                 $foundHost = $true
                 break 
@@ -347,27 +479,21 @@ function UpdateBlockFromItem {
             # keep any non-group header comments before the host line
             $rest = @()
             foreach ($header in $block.HeaderLines) {
-                if ($header.Trim() -match '^' + $EscapedGroupPrefix + '\s*(.+)$') { 
-                    # skip group comments (we will store them in Lines instead)
+                if (([string]$header) -match '^' + $EscapedGroupPrefix + '\s*(.+)$') { 
+                    # skip group comments (we will store them in block.Group only)
                 } else { 
-                    $rest += $header 
+                    $rest += [string]$header 
                 }
             }
             $block.HeaderLines = ,$hostLine + $rest
         }
     }
 
-    # Build new Lines (Group comment [as first indented line] + HostName/User/Port + Additional)
+    # Build new Lines (HostName/User/Port + Additional)
     $newLeading = @()
-    if ($item.HostName -and $item.HostName.Trim() -ne '') { 
-        $newLeading += "    HostName $($item.HostName.Trim())" 
-    }
-    if ($item.User -and $item.User.Trim() -ne '') { 
-        $newLeading += "    User $($item.User.Trim())" 
-    }
-    if ($item.Port -and $item.Port.Trim() -ne '') { 
-        $newLeading += "    Port $($item.Port.Trim())" 
-    }
+    if ($item.HostName -and $item.HostName.Trim() -ne '') { $newLeading += "    HostName $($item.HostName.Trim())" }
+    if ($item.User -and $item.User.Trim() -ne '') { $newLeading += "    User $($item.User.Trim())" }
+    if ($item.Port -and $item.Port.Trim() -ne '') { $newLeading += "    Port $($item.Port.Trim())" }
 
     if ($item.Additional -eq '') {
         $additionalLines = @()
@@ -375,16 +501,16 @@ function UpdateBlockFromItem {
         $additionalLines = [System.Text.RegularExpressions.Regex]::Split($item.Additional, "`r?`n")
     }
 
-    # Insert group comment as first indented line (after Host header)
+    # Update group logically (store only in block.Group; do NOT write a literal group line into Lines here)
     if ($item.Group -and $item.Group.Trim() -ne '') {
-        $groupLine = "    $GroupPrefix $($item.Group.Trim())"
         $block.Group = $item.Group.Trim()
         Add-RecentGroup -groupName $block.Group
-        $block.Lines = ,$groupLine + $newLeading + $additionalLines
     } else {
         $block.Group = $null
-        $block.Lines = $newLeading + $additionalLines
     }
+
+    # Lines should NOT contain the literal group comment; the writer will emit it on save.
+    $block.Lines = $newLeading + $additionalLines
 
     $Global:Blocks[$idx] = $block
 }
@@ -417,9 +543,7 @@ function Build-SshTarget {
         $hostValue 
     }
     $opts = @()
-    if ($item.Port -and $item.Port.Trim() -ne '') { 
-        $opts += "-p $($item.Port.Trim())" 
-    }
+    if ($item.Port -and $item.Port.Trim() -ne '') { $opts += "-p $($item.Port.Trim())" }
     return @{ Target = $target; Options = ($opts -join ' ') }
 }
 
@@ -580,7 +704,7 @@ function Launch-WinSCP-ForItem {
 $xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="SSH Config Manager (Inline Edit)" Height="700" Width="800" WindowStartupLocation="CenterScreen">
+        Title="SSH Config GUI" Height="700" Width="900" WindowStartupLocation="CenterScreen">
   <DockPanel LastChildFill="True" Margin="6">
     <!-- Top toolbar -->
     <WrapPanel DockPanel.Dock="Top" Orientation="Horizontal" Margin="0,0,0,6" VerticalAlignment="Center">
@@ -646,7 +770,7 @@ $xaml = @"
 
       <Border Grid.Column="1" BorderBrush="LightGray" BorderThickness="1" Padding="8">
         <StackPanel>
-          <TextBlock Text="Host Details (edit to apply to selected)" FontWeight="Bold" Margin="0,0,0,6"/>
+          <TextBlock Text="Host Details (CTRL+E to apply selected changes)" FontWeight="Bold" Margin="0,0,0,6"/>
 
           <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
             <CheckBox x:Name="ChkPattern" VerticalAlignment="Center" Margin="0,0,6,0"/>
@@ -683,12 +807,6 @@ $xaml = @"
             <CheckBox x:Name="ChkAdditional" VerticalAlignment="Top" Margin="0,4,6,0"/>
             <TextBox x:Name="FldAdditional" AcceptsReturn="True" Height="150" VerticalScrollBarVisibility="Auto" TextWrapping="Wrap" Width="250" />
           </StackPanel>
-
-          <WrapPanel Margin="0,6,0,6">
-            <Button x:Name="BtnApplyEdits" Width="110" Margin="0,0,6,0">Apply Edits (Ctrl+E)</Button>
-            <Button x:Name="BtnEditRaw" Width="90" Margin="0,0,6,0">Edit Raw (ext)</Button>
-            <Button x:Name="BtnRefresh" Width="80">Refresh List</Button>
-          </WrapPanel>
 
           <TextBlock Text="Tips:" FontWeight="Bold" Margin="0,10,0,4"/>
           <TextBlock TextWrapping="Wrap">
@@ -749,9 +867,6 @@ $ChkUser = $Window.FindName('ChkUser')
 $ChkPort = $Window.FindName('ChkPort')
 $ChkGroup = $Window.FindName('ChkGroup')
 $ChkAdditional = $Window.FindName('ChkAdditional')
-$BtnApplyEdits = $Window.FindName('BtnApplyEdits')
-$BtnEditRaw = $Window.FindName('BtnEditRaw')
-$BtnRefresh = $Window.FindName('BtnRefresh')
 $StatusText = $Window.FindName('StatusText')
 
 # WT settings controls
@@ -981,7 +1096,7 @@ $applyAction = {
     Refresh-List -filter $SearchBox.Text
     $StatusText.Text = "Applied edits to $($selItems.Count) host(s) (in memory)."
 }
-$BtnApplyEdits.Add_Click($applyAction)
+
 $BtnApply.Add_Click($applyAction)
 
 # Delete selected hosts with confirmation
@@ -1016,121 +1131,6 @@ $BtnDelete.Add_Click({
         Refresh-List -filter $SearchBox.Text
         $StatusText.Text = "Deleted $($selItems.Count) host(s) (in memory)."
     }
-})
-
-# Raw external edit with undo
-$BtnEditRaw.Add_Click({
-    $sel = $DataGrid.SelectedItem
-    if ($null -eq $sel) { 
-        [System.Windows.MessageBox]::Show("Select a host to edit raw.","Info")
-        return 
-    }
-    
-    PushUndo "Raw edit for $($sel.Pattern)"
-    $idx = $sel.BlockIndex
-    $block = $Global:Blocks[$idx]
-    $tmp = [System.IO.Path]::GetTempFileName() + ".sshedit"
-    
-    $buf = @()
-    foreach ($header in $block.HeaderLines) { $buf += $header }
-    foreach ($line in $block.Lines) { $buf += $line }
-    Set-Content -Path $tmp -Value ($buf -join [Environment]::NewLine) -Encoding utf8
-
-    $editorCmd = $Settings.Editor
-    $parts = $editorCmd -split '\s+'
-    $exe = $parts[0]
-    $args = @()
-    if ($parts.Count -gt 1) { $args += $parts[1..($parts.Count-1)] }
-    $args += $tmp
-    
-    try { 
-        Start-Process -FilePath $exe -ArgumentList $args -Wait -ErrorAction Stop 
-    } catch { 
-        & $exe $args 
-    }
-
-    $edited = Get-Content -Path $tmp -Raw -ErrorAction SilentlyContinue
-    if (-not $edited) { 
-        $StatusText.Text = "Raw edit cancelled"
-        return 
-    }
-    
-    $arr = [System.Text.RegularExpressions.Regex]::Split($edited, "`r?`n")
-    $hostLineIndex = -1
-    
-
-	for ($i=0; $i -lt $arr.Length; $i++) {
-		if ($arr[$i].Trim() -match '^(?i)Host\s+(.+)$') {
-			$hostLineIndex = $i
-			break
-		}
-	}
-
-    
-    if ($hostLineIndex -eq -1) { 
-        [System.Windows.MessageBox]::Show("Edited block must contain a Host line. Aborting.","Error")
-        return 
-    }
-    
-    $newHeader = $arr[0..$hostLineIndex]
-    $newLines = if ($hostLineIndex + 1 -lt $arr.Length) { 
-        $arr[($hostLineIndex+1)..($arr.Length-1)] 
-    } else { 
-        @() 
-    }
-    
-    $hostLine = $arr[$hostLineIndex].Trim()
-	$hostLine -match '^(?i)Host\s+(.+)$' | Out-Null
-    $newPatterns = $Matches[1].Trim().Split() | Where-Object { $_ -ne '' }
-    
-    # --- Normalize group extracted either from header or from first line of newLines ---
-    $group = $null
-    $groupPattern = '^' + $EscapedGroupPrefix + '\s*(.+)$'
-
-    # Check header (legacy placement)
-    for ($j=0; $j -lt $newHeader.Length; $j++) {
-        if ($newHeader[$j].Trim() -match $groupPattern) {
-            $group = $Matches[1].Trim()
-            # remove any group comment lines from header
-            $newHeader = $newHeader | Where-Object { -not ($_.Trim() -match $groupPattern) }
-            break
-        }
-    }
-
-    # If not found in header, check first line of newLines (new style): optional leading whitespace allowed
-    if (-not $group -and $newLines.Count -gt 0) {
-        $first = $newLines[0]
-        $linePattern = '^\s*' + $EscapedGroupPrefix + '\s*(.+)$'
-        if ($first -match $linePattern) {
-            $group = $Matches[1].Trim()
-            # remove the first line from newLines
-            if ($newLines.Count -eq 1) { $newLines = @() } else { $newLines = $newLines[1..($newLines.Count-1)] }
-        }
-    }
-
-    $Global:Blocks[$idx].HeaderLines = $newHeader
-    $Global:Blocks[$idx].Lines = $newLines
-    $Global:Blocks[$idx].HostPatterns = $newPatterns
-    $Global:Blocks[$idx].Group = $group
-    if ($group) { Add-RecentGroup -groupName $group }
-
-    Refresh-List -filter $SearchBox.Text
-    $StatusText.Text = "Raw edit applied (in memory)."
-})
-
-# Refresh from disk
-$BtnRefresh.Add_Click({
-    if ($Global:HasUnsavedChanges) {
-        $result = [System.Windows.MessageBox]::Show("You have unsaved changes. Refreshing will discard them. Continue?","Unsaved Changes",[System.Windows.MessageBoxButton]::YesNo,[System.Windows.MessageBoxImage]::Warning)
-        if ($result -eq 'No') { return }
-    }
-    
-    $Global:Blocks = Parse-SSHConfig
-    $Global:HasUnsavedChanges = $false
-    $Global:UndoStack = @()
-    $Global:RedoStack = @()
-    Refresh-List -filter $SearchBox.Text
-    $StatusText.Text = "Refreshed from $SshConfigPath"
 })
 
 # New host dialog
@@ -1237,13 +1237,10 @@ $BtnNew.Add_Click({
 
     PushUndo "Create host $($res.Pattern)"
 
-    # Build host block: Host header + (optional) indented group comment + indented settings
+    # Build host block: Host header + indented settings (group kept in block.Group, not in Lines)
     $header = @("Host " + $res.Pattern)
     $lines = @()
     
-    if ($res.Group -and $res.Group.Trim() -ne '') {
-        $lines += "    $GroupPrefix $($res.Group.Trim())"
-    }
     if ($res.HostName) { $lines += "    HostName $($res.HostName)" }
     if ($res.User) { $lines += "    User $($res.User)" }
     if ($res.Port) { $lines += "    Port $($res.Port)" }
@@ -1378,6 +1375,9 @@ $BtnReload.Add_Click({
         if ($result -eq 'No') { return }
     }
     
+    # Clear recent groups so they're rebuilt fresh from file
+    $Global:RecentGroups = @()
+    
     $Global:Blocks = Parse-SSHConfig
     $Global:HasUnsavedChanges = $false
     $Global:UndoStack = @()
@@ -1432,7 +1432,7 @@ $Window.Add_KeyDown({
     }
 })
 
-# Replace your current DataGrid.Add_MouseDoubleClick handler with this:
+# Mouse double-click handler (unchanged behavior)
 $DataGrid.Add_MouseDoubleClick({
     param($sender, $e)
 
