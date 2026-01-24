@@ -66,8 +66,48 @@ $Global:RecentGroups = @()
 $Global:HasUnsavedChanges = $false
 
 # ----------------------------
-# === Helpers
+# === Helpers (compat-safe)
 # ----------------------------
+# Robust: ensure the supplied value becomes an array of strings (never null or a char array)
+function Ensure-StringArray {
+    param([object]$value)
+
+    if ($null -eq $value) {
+        return @()
+    }
+
+    if ($value -is [System.Array]) {
+        return $value | ForEach-Object { [string]$_ }
+    }
+
+    # scalar (including empty string) -> return single-element array (empty string will be preserved)
+    return ,([string]$value)
+}
+
+# Robust: accept null, scalar string, or string[]; split any embedded CR/LF so each logical line is a separate element
+function Split-Lines {
+    param([object]$lines)
+    $out = @()
+
+    if ($null -eq $lines) { return $out }
+
+    if ($lines -is [System.Array]) {
+        foreach ($l in $lines) {
+            if ($null -eq $l) { continue }
+            $pieces = [System.Text.RegularExpressions.Regex]::Split([string]$l, "`r?`n")
+            foreach ($p in $pieces) { $out += [string]$p }
+        }
+        return $out
+    }
+
+    # scalar string
+    $s = [string]$lines
+    if ($s -eq '') { return $out }   # return empty array for empty string
+    $pieces = [System.Text.RegularExpressions.Regex]::Split($s, "`r?`n")
+    foreach ($p in $pieces) { $out += [string]$p }
+    return $out
+}
+
 function Ensure-Paths {
     if (-not (Test-Path $SshConfigPath)) { New-Item -ItemType File -Path $SshConfigPath -Force | Out-Null }
     if (-not (Test-Path $BackupFolder)) { New-Item -ItemType Directory -Path $BackupFolder -Force | Out-Null }
@@ -79,6 +119,7 @@ function Backup-Config {
     $dest = Join-Path $BackupFolder ("config.bak.$timestamp")
     try {
         Copy-Item -Path $SshConfigPath -Destination $dest -Force -ErrorAction Stop
+        # Optional pruning could be added here if desired
     } catch {
         [System.Windows.MessageBox]::Show("Failed to create backup: $($_.Exception.Message)","Backup Error",[System.Windows.MessageBoxButton]::OK,[System.Windows.MessageBoxImage]::Warning)
     }
@@ -294,24 +335,11 @@ function Parse-SSHConfig {
 
     # Final normalization: ensure HeaderLines and Lines (and HostPatterns) are arrays of strings (no chars)
     foreach ($b in $blocks) {
-        if ($null -eq $b.HeaderLines) {
-            $b.HeaderLines = @()
-        } elseif (-not ($b.HeaderLines -is [System.Array])) {
-            $b.HeaderLines = @($b.HeaderLines)
-        }
-        $b.HeaderLines = $b.HeaderLines | ForEach-Object { [string]$_ }
-
-        if ($null -eq $b.Lines) {
-            $b.Lines = @()
-        } elseif (-not ($b.Lines -is [System.Array])) {
-            $b.Lines = @($b.Lines)
-        }
-        $b.Lines = $b.Lines | ForEach-Object { [string]$_ }
-
-        # Ensure HostPatterns is an array of strings
-        if ($null -eq $b.HostPatterns) { $b.HostPatterns = @() }
-        if (-not ($b.HostPatterns -is [System.Array])) { $b.HostPatterns = @($b.HostPatterns) }
-        $b.HostPatterns = $b.HostPatterns | ForEach-Object { [string]$_ }
+        $b.HeaderLines  = Ensure-StringArray -value $b.HeaderLines
+        $b.Lines        = Ensure-StringArray -value $b.Lines
+        # expand any embedded newline pieces so we never have multi-line elements
+        $b.Lines        = Split-Lines -lines $b.Lines
+        $b.HostPatterns = Ensure-StringArray -value $b.HostPatterns
     }
 
     return $blocks
@@ -322,17 +350,16 @@ function Write-SSHConfigFromBlocks {
     Backup-Config
     $out = @()
 
-    foreach ($block in $blocks) {
+    for ($i = 0; $i -lt $blocks.Count; $i++) {
+        $block = $blocks[$i]
+
         # Defensive normalization
-        if ($null -eq $block.HeaderLines) { $block.HeaderLines = @() }
-        if (-not ($block.HeaderLines -is [System.Array])) { $block.HeaderLines = @($block.HeaderLines) }
-        $block.HeaderLines = $block.HeaderLines | ForEach-Object { [string]$_ }
+        $block.HeaderLines = Ensure-StringArray -value $block.HeaderLines
+        $block.Lines = Ensure-StringArray -value $block.Lines
+        $block.Lines = Split-Lines -lines $block.Lines
 
-        if ($null -eq $block.Lines) { $block.Lines = @() }
-        if (-not ($block.Lines -is [System.Array])) { $block.Lines = @($block.Lines) }
-        $block.Lines = $block.Lines | ForEach-Object { [string]$_ }
-
-        # For host blocks: prepare a single Host header and reorganize header lines
+        # For host blocks: prepare host header and reorder blank headers above it
+        $preHeaderBlanks = @()
         if ($block.Type -eq 'host') {
             $hostLine = ""
             if ($block.HostPatterns -and $block.HostPatterns.Count -gt 0) {
@@ -353,21 +380,14 @@ function Write-SSHConfigFromBlocks {
                 else { $commentHeaders += $s }                    # other header/comment lines
             }
 
-            # We'll write blankHeaders BEFORE the Host header (preserves visual separation above the Host).
-            # Then write the canonical hostLine, then any commentHeaders (non-empty header comments).
-            # Store new HeaderLines for possible duplication checks later
-            if ($blankHeaders.Count -gt 0) {
-                # blank headers will be emitted prior to Host header rather than sitting after it
-                $preHeaderBlanks = $blankHeaders
-            } else {
-                $preHeaderBlanks = @()
-            }
+            $preHeaderBlanks = $blankHeaders
 
-            $block.HeaderLines = @()
+            $newHeaderLines = @()
             if ($hostLine -and $hostLine.Trim() -ne '') {
-                $block.HeaderLines += $hostLine
+                $newHeaderLines += $hostLine
             }
-            foreach ($ch in $commentHeaders) { $block.HeaderLines += $ch }
+            foreach ($ch in $commentHeaders) { $newHeaderLines += $ch }
+            $block.HeaderLines = $newHeaderLines
         } else {
             $preHeaderBlanks = @()
         }
@@ -396,11 +416,15 @@ function Write-SSHConfigFromBlocks {
             }
         }
 
-        # Write block lines: defensive split of any element that might contain embedded newlines
-        foreach ($line in $block.Lines) {
-            # split on CR/LF sequences so each logical line becomes its own output element
-            $pieces = [System.Text.RegularExpressions.Regex]::Split([string]$line, "`r?`n")
-            foreach ($p in $pieces) { $out += $p }
+        # Write block lines (each is already a single logical line)
+        foreach ($line in $block.Lines) { $out += $line }
+
+        # Ensure at least one blank line separates this host from the next host (if next block exists and is 'host')
+        if ($block.Type -eq 'host' -and $i -lt ($blocks.Count - 1) -and $blocks[$i+1].Type -eq 'host') {
+            # Only add a single blank line if the output doesn't already end with one
+            if ($out.Count -eq 0 -or ([string]$out[-1]).Trim() -ne '') {
+                $out += ''
+            }
         }
     }
 
@@ -430,10 +454,29 @@ function Get-HostObjectsFromBlocks {
         $hostName = ($block.Lines | Where-Object { $_ -match '^(?i)\s*HostName\s+(.+)$' } | ForEach-Object { $Matches[1].Trim() }) | Select-Object -First 1
         $user = ($block.Lines | Where-Object { $_ -match '^(?i)\s*User\s+(.+)$' } | ForEach-Object { $Matches[1].Trim() }) | Select-Object -First 1
         $port = ($block.Lines | Where-Object { $_ -match '^(?i)\s*Port\s+(.+)$' } | ForEach-Object { $Matches[1].Trim() }) | Select-Object -First 1
+        $forward = ($block.Lines | Where-Object { $_ -match '^(?i)\s*ForwardAgent\s+(.+)$' } | ForEach-Object { $Matches[1].Trim() }) | Select-Object -First 1
 
-        # Exclude group comment line (groups are stored in block.Group), and exclude host/user/port lines from Additional
-        $additionalLines = $block.Lines | Where-Object { -not ([string]$_ -match '^\s*' + [regex]::Escape($GroupPrefix) + '\s*') } | Where-Object { -not ([string]$_ -match '^(?i)\s*(HostName|User|Port)\s+') }
-        $additionalText = ($additionalLines -join [Environment]::NewLine)
+        # Exclude group comment line and known option lines from Additional
+        $additionalLines = $block.Lines `
+            | Where-Object { -not ([string]$_ -match '^\s*' + [regex]::Escape($GroupPrefix) + '\s*') } `
+            | Where-Object { -not ([string]$_ -match '^(?i)\s*(HostName|User|Port|ForwardAgent)\s+') }
+
+        # Normalize additional lines for display: remove exactly one leading 4-space indent if present,
+        # preserve blank lines (empty strings) as-is.
+        $displayAdditional = @()
+        foreach ($al in $additionalLines) {
+            $s = [string]$al
+            if ($s -eq '') {
+                $displayAdditional += ''
+            } elseif ($s -match '^\s{4}(.*)$') {
+                $displayAdditional += $Matches[1]
+            } else {
+                # No canonical indent present; return the line trimmed (but do not strip internal leading spaces)
+                $displayAdditional += $s.TrimStart()
+            }
+        }
+
+        $additionalText = ($displayAdditional -join [Environment]::NewLine)
         
         $obj = [pscustomobject]@{
             Pattern = ($block.HostPatterns -join ',')
@@ -442,6 +485,7 @@ function Get-HostObjectsFromBlocks {
             Port = if ($port) { [string]$port } else { '' }
             Additional = if ($additionalText) { [string]$additionalText } else { '' }
             Group = if ($block.Group) { [string]$block.Group } else { '' }
+            ForwardAgent = if ($forward) { [string]$forward } else { '' }
             BlockIndex = $i
         }
         $list += $obj
@@ -456,11 +500,9 @@ function UpdateBlockFromItem {
     $block = $Global:Blocks[$idx]
 
     # Defensive: make sure HeaderLines and Lines are arrays of strings
-    if ($null -eq $block.HeaderLines) { $block.HeaderLines = @() } elseif (-not ($block.HeaderLines -is [System.Array])) { $block.HeaderLines = @($block.HeaderLines) }
-    $block.HeaderLines = $block.HeaderLines | ForEach-Object { [string]$_ }
-
-    if ($null -eq $block.Lines) { $block.Lines = @() } elseif (-not ($block.Lines -is [System.Array])) { $block.Lines = @($block.Lines) }
-    $block.Lines = $block.Lines | ForEach-Object { [string]$_ }
+    $block.HeaderLines = Ensure-StringArray -value $block.HeaderLines
+    $block.Lines = Ensure-StringArray -value $block.Lines
+    $block.Lines = Split-Lines -lines $block.Lines
 
     # Host patterns
     $newPatterns = ($item.Pattern -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
@@ -489,16 +531,34 @@ function UpdateBlockFromItem {
         }
     }
 
-    # Build new Lines (HostName/User/Port + Additional)
+    # Build new Lines (HostName/User/Port/ForwardAgent + Additional)
     $newLeading = @()
     if ($item.HostName -and $item.HostName.Trim() -ne '') { $newLeading += "    HostName $($item.HostName.Trim())" }
     if ($item.User -and $item.User.Trim() -ne '') { $newLeading += "    User $($item.User.Trim())" }
     if ($item.Port -and $item.Port.Trim() -ne '') { $newLeading += "    Port $($item.Port.Trim())" }
 
+    # ForwardAgent handling: include only if non-empty (UI supplies raw token)
+    if ($item.ForwardAgent -and $item.ForwardAgent.Trim() -ne '') {
+        $newLeading += "    ForwardAgent $($item.ForwardAgent.Trim())"
+    }
+
+    # Additional: split into lines, preserve empties, remove any leading indentation the user shouldn't see,
+    # then add canonical 4-space indent for non-empty lines.
     if ($item.Additional -eq '') {
         $additionalLines = @()
     } else {
-        $additionalLines = [System.Text.RegularExpressions.Regex]::Split($item.Additional, "`r?`n")
+        $pieces = [System.Text.RegularExpressions.Regex]::Split($item.Additional, "`r?`n")
+        $additionalLines = @()
+        foreach ($p in $pieces) {
+            if ($p -ne $null -and $p.Trim() -ne '') {
+                # remove any leading whitespace the user might have pasted and then indent once
+                $clean = $p.TrimStart()
+                $additionalLines += ("    " + $clean)
+            } else {
+                # preserve blank line (empty string)
+                $additionalLines += ''
+            }
+        }
     }
 
     # Update group logically (store only in block.Group; do NOT write a literal group line into Lines here)
@@ -509,7 +569,7 @@ function UpdateBlockFromItem {
         $block.Group = $null
     }
 
-    # Lines should NOT contain the literal group comment; the writer will emit it on save.
+    # Replace Lines with the canonical lines (no duplicate indents)
     $block.Lines = $newLeading + $additionalLines
 
     $Global:Blocks[$idx] = $block
@@ -802,6 +862,13 @@ $xaml = @"
             <TextBox x:Name="FldGroup" Width="180" />
           </StackPanel>
 
+          <!-- ForwardAgent row -->
+          <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+            <CheckBox x:Name="ChkForwardAgent" VerticalAlignment="Center" Margin="0,0,6,0"/>
+            <TextBlock Width="70" VerticalAlignment="Center">Fwd Agent:</TextBlock>
+            <TextBox x:Name="FldForwardAgent" Width="180" />
+          </StackPanel>
+
           <TextBlock Text="Additional lines (multi-line):" FontWeight="Bold" Margin="0,6,0,2"/>
           <StackPanel Orientation="Horizontal" Margin="0,0,0,6">
             <CheckBox x:Name="ChkAdditional" VerticalAlignment="Top" Margin="0,4,6,0"/>
@@ -860,12 +927,14 @@ $FldHostName = $Window.FindName('FldHostName')
 $FldUser = $Window.FindName('FldUser')
 $FldPort = $Window.FindName('FldPort')
 $FldGroup = $Window.FindName('FldGroup')
+$FldForwardAgent = $Window.FindName('FldForwardAgent')
 $FldAdditional = $Window.FindName('FldAdditional')
 $ChkPattern = $Window.FindName('ChkPattern')
 $ChkHostName = $Window.FindName('ChkHostName')
 $ChkUser = $Window.FindName('ChkUser')
 $ChkPort = $Window.FindName('ChkPort')
 $ChkGroup = $Window.FindName('ChkGroup')
+$ChkForwardAgent = $Window.FindName('ChkForwardAgent')
 $ChkAdditional = $Window.FindName('ChkAdditional')
 $StatusText = $Window.FindName('StatusText')
 
@@ -967,12 +1036,14 @@ $DataGrid.Add_SelectionChanged({
         $FldUser.Text = ''
         $FldPort.Text = ''
         $FldGroup.Text = ''
+        $FldForwardAgent.Text = ''
         $FldAdditional.Text = ''
         $ChkPattern.IsChecked = $false
         $ChkHostName.IsChecked = $false
         $ChkUser.IsChecked = $false
         $ChkPort.IsChecked = $false
         $ChkGroup.IsChecked = $false
+        $ChkForwardAgent.IsChecked = $false
         $ChkAdditional.IsChecked = $false
         $StatusText.Text = "No selection"
         return
@@ -983,6 +1054,7 @@ $DataGrid.Add_SelectionChanged({
         $FldUser.Text = [string]$it.User
         $FldPort.Text = [string]$it.Port
         $FldGroup.Text = [string]$it.Group
+        $FldForwardAgent.Text = [string]$it.ForwardAgent
         $FldAdditional.Text = [string]$it.Additional
         # defaults: single selection -> all checked
         $ChkPattern.IsChecked = $true
@@ -990,6 +1062,7 @@ $DataGrid.Add_SelectionChanged({
         $ChkUser.IsChecked = $true
         $ChkPort.IsChecked = $true
         $ChkGroup.IsChecked = $true
+        $ChkForwardAgent.IsChecked = $true
         $ChkAdditional.IsChecked = $true
         $StatusText.Text = "Selected: $($it.Pattern)"
     } else {
@@ -998,6 +1071,7 @@ $DataGrid.Add_SelectionChanged({
         $commonUser = Get-CommonValue -items $selItems -prop 'User'
         $commonPort = Get-CommonValue -items $selItems -prop 'Port'
         $commonGroup = Get-CommonValue -items $selItems -prop 'Group'
+        $commonForward = Get-CommonValue -items $selItems -prop 'ForwardAgent'
         $commonAdditional = Get-CommonValue -items $selItems -prop 'Additional'
 
         if ($commonPattern -ne $null -and $commonPattern -ne '') { 
@@ -1038,6 +1112,14 @@ $DataGrid.Add_SelectionChanged({
         } else { 
             $FldGroup.Text = ''
             $ChkGroup.IsChecked = $false 
+        }
+
+        if ($commonForward -ne $null -and $commonForward -ne '') {
+            $FldForwardAgent.Text = $commonForward
+            $ChkForwardAgent.IsChecked = $true
+        } else {
+            $FldForwardAgent.Text = ''
+            $ChkForwardAgent.IsChecked = $false
         }
         
         if ($commonAdditional -ne $null -and $commonAdditional -ne '') { 
@@ -1089,6 +1171,7 @@ $applyAction = {
         if ($ChkUser.IsChecked) { $it.User = $FldUser.Text }
         if ($ChkPort.IsChecked) { $it.Port = $FldPort.Text }
         if ($ChkGroup.IsChecked) { $it.Group = $FldGroup.Text }
+        if ($ChkForwardAgent.IsChecked) { $it.ForwardAgent = $FldForwardAgent.Text } else { $it.ForwardAgent = '' }
         if ($ChkAdditional.IsChecked) { $it.Additional = $FldAdditional.Text }
         UpdateBlockFromItem -item $it
     }
@@ -1096,7 +1179,6 @@ $applyAction = {
     Refresh-List -filter $SearchBox.Text
     $StatusText.Text = "Applied edits to $($selItems.Count) host(s) (in memory)."
 }
-
 $BtnApply.Add_Click($applyAction)
 
 # Delete selected hosts with confirmation
@@ -1432,7 +1514,7 @@ $Window.Add_KeyDown({
     }
 })
 
-# Mouse double-click handler (unchanged behavior)
+# Mouse double-click handler (unchanged behavior except populating ForwardAgent)
 $DataGrid.Add_MouseDoubleClick({
     param($sender, $e)
 
@@ -1449,12 +1531,14 @@ $DataGrid.Add_MouseDoubleClick({
     $FldUser.Text = [string]$item.User
     $FldPort.Text = [string]$item.Port
     $FldGroup.Text = [string]$item.Group
+    $FldForwardAgent.Text = [string]$item.ForwardAgent
     $FldAdditional.Text = [string]$item.Additional
     $ChkPattern.IsChecked = $true
     $ChkHostName.IsChecked = $true
     $ChkUser.IsChecked = $true
     $ChkPort.IsChecked = $true
     $ChkGroup.IsChecked = $true
+    $ChkForwardAgent.IsChecked = $true
     $ChkAdditional.IsChecked = $true
 
     $StatusText.Text = if ($selItems.Count -gt 1) { "Selected: $($selItems.Count) rows" } else { "Selected: $($item.Pattern)" }
