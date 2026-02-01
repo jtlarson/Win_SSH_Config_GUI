@@ -946,7 +946,7 @@ $BtnSaveWTSettings = $Window.FindName('BtnSaveWTSettings')
 # ----------------------------
 # === State and population
 # ----------------------------
-$Global:Blocks = Parse-SSHConfig
+$Global:Blocks = @(Parse-SSHConfig)  # Force array with @()
 $Global:Observable = New-Object System.Collections.ObjectModel.ObservableCollection[Object]
 $Window.Dispatcher.Invoke([action]{ $DataGrid.ItemsSource = $Global:Observable })
 
@@ -1331,19 +1331,26 @@ $BtnNew.Add_Click({
         Type = 'host'
         HeaderLines = $header
         Lines = $lines
-        HostPatterns = ($res.Pattern -split '\s+')
+        HostPatterns = @($res.Pattern.Trim())
         Group = if ($res.Group -and $res.Group.Trim() -ne '') { $res.Group.Trim() } else { $null } 
     }
     
-    # Insert host before trailing global block if present, otherwise append
-    $count = $Global:Blocks.Count
-    if ($count -gt 0 -and $Global:Blocks[$count - 1].Type -eq 'global') {
-        $before = @()
-        if ($count -gt 1) { $before = $Global:Blocks[0..($count - 2)] }
-        $after = $Global:Blocks[$count - 1]
-        $Global:Blocks = $before + ,$block + ,$after
+    # FIX: Ensure $Global:Blocks is always an array
+    if ($null -eq $Global:Blocks -or $Global:Blocks.Count -eq 0) {
+        $Global:Blocks = @($block)
     } else {
-        $Global:Blocks += ,$block
+        # Force array conversion
+        $tempBlocks = @($Global:Blocks)
+        $count = $tempBlocks.Count
+        
+        if ($tempBlocks[$count - 1].Type -eq 'global') {
+            $before = @()
+            if ($count -gt 1) { $before = $tempBlocks[0..($count - 2)] }
+            $after = $tempBlocks[$count - 1]
+            $Global:Blocks = @($before) + @($block) + @($after)
+        } else {
+            $Global:Blocks = @($tempBlocks) + @($block)
+        }
     }
 
     # Refresh list with empty filter so the new entry is visible
@@ -1460,7 +1467,7 @@ $BtnReload.Add_Click({
     # Clear recent groups so they're rebuilt fresh from file
     $Global:RecentGroups = @()
     
-    $Global:Blocks = Parse-SSHConfig
+    $Global:Blocks = @(Parse-SSHConfig)  # FIX: Force array
     $Global:HasUnsavedChanges = $false
     $Global:UndoStack = @()
     $Global:RedoStack = @()
